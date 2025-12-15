@@ -1,0 +1,734 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using Unity.WebRTC;
+
+/// <summary>
+/// Gestionnaire de chat vocal WebRTC pour la communication entre joueurs VR.
+/// Utilise le serveur WebSocket existant pour le signaling.
+/// </summary>
+public class VoiceChatManager : MonoBehaviour
+{
+    public static VoiceChatManager Instance { get; private set; }
+    
+    [Header("Audio Settings")]
+    [Tooltip("Activer le microphone au démarrage")]
+    public bool autoStartMicrophone = false;
+    
+    [Tooltip("Volume du microphone (0-1)")]
+    [Range(0f, 1f)]
+    public float microphoneVolume = 1f;
+    
+    [Tooltip("Volume des autres joueurs (0-1)")]
+    [Range(0f, 1f)]
+    public float playbackVolume = 1f;
+    
+    [Tooltip("Activer la suppression d'écho")]
+    public bool echoCancellation = true;
+    
+    [Tooltip("Activer la suppression du bruit")]
+    public bool noiseSuppression = true;
+    
+    [Header("Push To Talk")]
+    [Tooltip("Utiliser Push-To-Talk au lieu de voix continue")]
+    public bool usePushToTalk = false;
+    
+    [Tooltip("Touche pour Push-To-Talk")]
+    public KeyCode pushToTalkKey = KeyCode.V;
+    
+    [Header("Debug")]
+    public bool showDebugInfo = false;
+    
+    // État
+    private bool _isInitialized = false;
+    private bool _isMicrophoneActive = false;
+    private AudioSource _microphoneAudioSource;
+    private string _selectedMicrophone;
+    
+    // WebRTC
+    private Dictionary<string, RTCPeerConnection> _peerConnections = new Dictionary<string, RTCPeerConnection>();
+    private Dictionary<string, AudioSource> _remoteAudioSources = new Dictionary<string, AudioSource>();
+    private MediaStream _localStream;
+    private AudioStreamTrack _localAudioTrack;
+    
+    // Configuration STUN/TURN
+    private RTCConfiguration _rtcConfig = new RTCConfiguration
+    {
+        iceServers = new[]
+        {
+            new RTCIceServer { urls = new[] { "stun:stun.l.google.com:19302" } },
+            new RTCIceServer { urls = new[] { "stun:stun1.l.google.com:19302" } }
+        }
+    };
+    
+    // Events
+    public static event Action OnVoiceChatReady;
+    public static event Action<string> OnPeerConnected;
+    public static event Action<string> OnPeerDisconnected;
+    public static event Action<bool> OnMicrophoneStateChanged;
+    
+    void Awake()
+    {
+        if (Instance != null)
+        {
+            Destroy(gameObject);
+            return;
+        }
+        Instance = this;
+        DontDestroyOnLoad(gameObject);
+    }
+    
+    void Start()
+    {
+        StartCoroutine(InitializeWebRTC());
+    }
+    
+    void OnEnable()
+    {
+        VRNetworkManager.OnMessageReceived += HandleNetworkMessage;
+        VRRoomManager.OnPlayerJoined += OnPlayerJoined;
+        VRRoomManager.OnPlayerLeft += OnPlayerLeft;
+        VRRoomManager.OnRoomLeft += OnRoomLeft;
+    }
+    
+    void OnDisable()
+    {
+        VRNetworkManager.OnMessageReceived -= HandleNetworkMessage;
+        VRRoomManager.OnPlayerJoined -= OnPlayerJoined;
+        VRRoomManager.OnPlayerLeft -= OnPlayerLeft;
+        VRRoomManager.OnRoomLeft -= OnRoomLeft;
+    }
+    
+    void Update()
+    {
+        // Push-To-Talk
+        if (usePushToTalk && _isInitialized)
+        {
+            if (Input.GetKeyDown(pushToTalkKey))
+            {
+                StartMicrophone();
+            }
+            else if (Input.GetKeyUp(pushToTalkKey))
+            {
+                StopMicrophone();
+            }
+        }
+    }
+    
+    void OnDestroy()
+    {
+        CleanupAll();
+    }
+    
+    #region Initialization
+    
+    IEnumerator InitializeWebRTC()
+    {
+        Debug.Log("[VoiceChat] Initializing WebRTC...");
+        
+        // Note: Dans les versions récentes de Unity WebRTC, 
+        // l'initialisation est automatique, pas besoin d'appeler Initialize()
+        
+        yield return new WaitForSeconds(0.5f);
+        
+        // Créer l'AudioSource pour le microphone
+        _microphoneAudioSource = gameObject.AddComponent<AudioSource>();
+        _microphoneAudioSource.loop = true;
+        _microphoneAudioSource.playOnAwake = false;
+        _microphoneAudioSource.volume = 0; // On n'écoute pas notre propre micro
+        
+        // Sélectionner le microphone par défaut
+        if (Microphone.devices.Length > 0)
+        {
+            _selectedMicrophone = Microphone.devices[0];
+            Debug.Log($"[VoiceChat] Microphone found: {_selectedMicrophone}");
+        }
+        else
+        {
+            Debug.LogWarning("[VoiceChat] No microphone found!");
+        }
+        
+        _isInitialized = true;
+        Debug.Log("[VoiceChat] WebRTC initialized successfully");
+        
+        OnVoiceChatReady?.Invoke();
+        
+        // Auto-start si configuré
+        if (autoStartMicrophone)
+        {
+            StartMicrophone();
+        }
+    }
+    
+    #endregion
+    
+    #region Microphone Control
+    
+    /// <summary>
+    /// Démarre le microphone et commence la capture audio.
+    /// </summary>
+    public void StartMicrophone()
+    {
+        if (!_isInitialized || string.IsNullOrEmpty(_selectedMicrophone))
+        {
+            Debug.LogWarning("[VoiceChat] Cannot start microphone - not initialized or no device");
+            return;
+        }
+        
+        if (_isMicrophoneActive)
+        {
+            Debug.Log("[VoiceChat] Microphone already active");
+            return;
+        }
+        
+        StartCoroutine(StartMicrophoneCoroutine());
+    }
+    
+    IEnumerator StartMicrophoneCoroutine()
+    {
+        // Démarrer l'enregistrement du microphone
+        _microphoneAudioSource.clip = Microphone.Start(_selectedMicrophone, true, 1, 48000);
+        
+        // Attendre que le microphone soit prêt
+        while (Microphone.GetPosition(_selectedMicrophone) <= 0)
+        {
+            yield return null;
+        }
+        
+        _microphoneAudioSource.Play();
+        
+        // Créer le stream audio local
+        _localAudioTrack = new AudioStreamTrack(_microphoneAudioSource);
+        _localStream = new MediaStream();
+        _localStream.AddTrack(_localAudioTrack);
+        
+        _isMicrophoneActive = true;
+        
+        Debug.Log("[VoiceChat] Microphone started");
+        OnMicrophoneStateChanged?.Invoke(true);
+        
+        // Ajouter la piste audio à toutes les connexions existantes
+        foreach (var kvp in _peerConnections)
+        {
+            AddTrackToPeer(kvp.Key);
+        }
+    }
+    
+    /// <summary>
+    /// Arrête le microphone.
+    /// </summary>
+    public void StopMicrophone()
+    {
+        if (!_isMicrophoneActive) return;
+        
+        Microphone.End(_selectedMicrophone);
+        _microphoneAudioSource.Stop();
+        
+        if (_localAudioTrack != null)
+        {
+            _localAudioTrack.Dispose();
+            _localAudioTrack = null;
+        }
+        
+        if (_localStream != null)
+        {
+            _localStream.Dispose();
+            _localStream = null;
+        }
+        
+        _isMicrophoneActive = false;
+        
+        Debug.Log("[VoiceChat] Microphone stopped");
+        OnMicrophoneStateChanged?.Invoke(false);
+    }
+    
+    /// <summary>
+    /// Bascule l'état du microphone.
+    /// </summary>
+    public void ToggleMicrophone()
+    {
+        if (_isMicrophoneActive)
+            StopMicrophone();
+        else
+            StartMicrophone();
+    }
+    
+    /// <summary>
+    /// Change le microphone utilisé.
+    /// </summary>
+    public void SetMicrophone(string deviceName)
+    {
+        if (_isMicrophoneActive)
+        {
+            StopMicrophone();
+        }
+        
+        _selectedMicrophone = deviceName;
+        Debug.Log($"[VoiceChat] Microphone changed to: {deviceName}");
+    }
+    
+    /// <summary>
+    /// Retourne la liste des microphones disponibles.
+    /// </summary>
+    public string[] GetAvailableMicrophones()
+    {
+        return Microphone.devices;
+    }
+    
+    #endregion
+    
+    #region Peer Connection Management
+    
+    void OnPlayerJoined(VRPlayerData player)
+    {
+        if (player.playerId == VRNetworkManager.LocalId) return;
+        
+        Debug.Log($"[VoiceChat] Player joined, creating peer connection: {player.playerId}");
+        StartCoroutine(CreatePeerConnection(player.playerId, true));
+    }
+    
+    void OnPlayerLeft(string playerId)
+    {
+        ClosePeerConnection(playerId);
+    }
+    
+    void OnRoomLeft()
+    {
+        CloseAllPeerConnections();
+    }
+    
+    IEnumerator CreatePeerConnection(string peerId, bool createOffer)
+    {
+        if (_peerConnections.ContainsKey(peerId))
+        {
+            Debug.Log($"[VoiceChat] Peer connection already exists for: {peerId}");
+            yield break;
+        }
+        
+        Debug.Log($"[VoiceChat] Creating peer connection for: {peerId}");
+        
+        var pc = new RTCPeerConnection(ref _rtcConfig);
+        _peerConnections[peerId] = pc;
+        
+        // Créer l'AudioSource pour ce peer
+        var audioSource = gameObject.AddComponent<AudioSource>();
+        audioSource.spatialBlend = 0; // 2D audio (ou 1 pour 3D)
+        audioSource.volume = playbackVolume;
+        _remoteAudioSources[peerId] = audioSource;
+        
+        // Event handlers
+        pc.OnIceCandidate = candidate =>
+        {
+            if (candidate != null)
+            {
+                SendIceCandidate(peerId, candidate);
+            }
+        };
+        
+        pc.OnIceConnectionChange = state =>
+        {
+            Debug.Log($"[VoiceChat] ICE connection state for {peerId}: {state}");
+            
+            if (state == RTCIceConnectionState.Connected)
+            {
+                OnPeerConnected?.Invoke(peerId);
+            }
+            else if (state == RTCIceConnectionState.Disconnected || 
+                     state == RTCIceConnectionState.Failed)
+            {
+                OnPeerDisconnected?.Invoke(peerId);
+            }
+        };
+        
+        pc.OnTrack = e =>
+        {
+            Debug.Log($"[VoiceChat] Received track from {peerId}");
+            
+            if (e.Track is AudioStreamTrack audioTrack)
+            {
+                audioSource.SetTrack(audioTrack);
+                audioSource.loop = true;
+                audioSource.Play();
+                Debug.Log($"[VoiceChat] Playing audio from {peerId}");
+            }
+        };
+        
+        // Ajouter notre piste audio si le micro est actif
+        if (_isMicrophoneActive && _localAudioTrack != null)
+        {
+            pc.AddTrack(_localAudioTrack, _localStream);
+        }
+        
+        // Créer une offre si on est l'initiateur
+        if (createOffer)
+        {
+            yield return StartCoroutine(CreateAndSendOffer(peerId, pc));
+        }
+    }
+    
+    void AddTrackToPeer(string peerId)
+    {
+        if (!_peerConnections.TryGetValue(peerId, out var pc)) return;
+        if (_localAudioTrack == null) return;
+        
+        pc.AddTrack(_localAudioTrack, _localStream);
+        Debug.Log($"[VoiceChat] Added audio track to peer: {peerId}");
+    }
+    
+    IEnumerator CreateAndSendOffer(string peerId, RTCPeerConnection pc)
+    {
+        var op = pc.CreateOffer();
+        yield return op;
+        
+        if (op.IsError)
+        {
+            Debug.LogError($"[VoiceChat] Error creating offer: {op.Error.message}");
+            yield break;
+        }
+        
+        var desc = op.Desc;
+        var op2 = pc.SetLocalDescription(ref desc);
+        yield return op2;
+        
+        if (op2.IsError)
+        {
+            Debug.LogError($"[VoiceChat] Error setting local description: {op2.Error.message}");
+            yield break;
+        }
+        
+        // Envoyer l'offre via WebSocket
+        SendSignalingMessage(peerId, "webrtc-offer", new SignalingData
+        {
+            sdp = desc.sdp,
+            type = desc.type.ToString()
+        });
+        
+        Debug.Log($"[VoiceChat] Sent offer to: {peerId}");
+    }
+    
+    void ClosePeerConnection(string peerId)
+    {
+        if (_peerConnections.TryGetValue(peerId, out var pc))
+        {
+            pc.Close();
+            pc.Dispose();
+            _peerConnections.Remove(peerId);
+        }
+        
+        if (_remoteAudioSources.TryGetValue(peerId, out var audioSource))
+        {
+            Destroy(audioSource);
+            _remoteAudioSources.Remove(peerId);
+        }
+        
+        Debug.Log($"[VoiceChat] Closed peer connection: {peerId}");
+        OnPeerDisconnected?.Invoke(peerId);
+    }
+    
+    void CloseAllPeerConnections()
+    {
+        var peerIds = new List<string>(_peerConnections.Keys);
+        foreach (var peerId in peerIds)
+        {
+            ClosePeerConnection(peerId);
+        }
+    }
+    
+    void CleanupAll()
+    {
+        StopMicrophone();
+        CloseAllPeerConnections();
+        
+        Debug.Log("[VoiceChat] Cleanup complete");
+    }
+    
+    #endregion
+    
+    #region Signaling (WebSocket)
+    
+    void HandleNetworkMessage(NetworkMessage msg)
+    {
+        switch (msg.type)
+        {
+            case "webrtc-offer":
+                HandleOffer(msg);
+                break;
+            case "webrtc-answer":
+                HandleAnswer(msg);
+                break;
+            case "webrtc-ice-candidate":
+                HandleIceCandidate(msg);
+                break;
+        }
+    }
+    
+    void HandleOffer(NetworkMessage msg)
+    {
+        var data = JsonUtility.FromJson<SignalingData>(msg.data);
+        string peerId = msg.senderId;
+        
+        Debug.Log($"[VoiceChat] Received offer from: {peerId}");
+        
+        StartCoroutine(ProcessOffer(peerId, data));
+    }
+    
+    IEnumerator ProcessOffer(string peerId, SignalingData data)
+    {
+        // Créer la connexion si elle n'existe pas
+        if (!_peerConnections.ContainsKey(peerId))
+        {
+            yield return StartCoroutine(CreatePeerConnection(peerId, false));
+        }
+        
+        var pc = _peerConnections[peerId];
+        
+        // Appliquer l'offre distante
+        var desc = new RTCSessionDescription
+        {
+            type = RTCSdpType.Offer,
+            sdp = data.sdp
+        };
+        
+        var op = pc.SetRemoteDescription(ref desc);
+        yield return op;
+        
+        if (op.IsError)
+        {
+            Debug.LogError($"[VoiceChat] Error setting remote description: {op.Error.message}");
+            yield break;
+        }
+        
+        // Créer et envoyer la réponse
+        var op2 = pc.CreateAnswer();
+        yield return op2;
+        
+        if (op2.IsError)
+        {
+            Debug.LogError($"[VoiceChat] Error creating answer: {op2.Error.message}");
+            yield break;
+        }
+        
+        var answerDesc = op2.Desc;
+        var op3 = pc.SetLocalDescription(ref answerDesc);
+        yield return op3;
+        
+        if (op3.IsError)
+        {
+            Debug.LogError($"[VoiceChat] Error setting local description: {op3.Error.message}");
+            yield break;
+        }
+        
+        SendSignalingMessage(peerId, "webrtc-answer", new SignalingData
+        {
+            sdp = answerDesc.sdp,
+            type = answerDesc.type.ToString()
+        });
+        
+        Debug.Log($"[VoiceChat] Sent answer to: {peerId}");
+    }
+    
+    void HandleAnswer(NetworkMessage msg)
+    {
+        var data = JsonUtility.FromJson<SignalingData>(msg.data);
+        string peerId = msg.senderId;
+        
+        Debug.Log($"[VoiceChat] Received answer from: {peerId}");
+        
+        StartCoroutine(ProcessAnswer(peerId, data));
+    }
+    
+    IEnumerator ProcessAnswer(string peerId, SignalingData data)
+    {
+        if (!_peerConnections.TryGetValue(peerId, out var pc))
+        {
+            Debug.LogError($"[VoiceChat] No peer connection for: {peerId}");
+            yield break;
+        }
+        
+        var desc = new RTCSessionDescription
+        {
+            type = RTCSdpType.Answer,
+            sdp = data.sdp
+        };
+        
+        var op = pc.SetRemoteDescription(ref desc);
+        yield return op;
+        
+        if (op.IsError)
+        {
+            Debug.LogError($"[VoiceChat] Error setting remote description: {op.Error.message}");
+        }
+    }
+    
+    void HandleIceCandidate(NetworkMessage msg)
+    {
+        var data = JsonUtility.FromJson<IceCandidateData>(msg.data);
+        string peerId = msg.senderId;
+        
+        if (!_peerConnections.TryGetValue(peerId, out var pc))
+        {
+            Debug.LogWarning($"[VoiceChat] No peer connection for ICE candidate: {peerId}");
+            return;
+        }
+        
+        var candidate = new RTCIceCandidate(new RTCIceCandidateInit
+        {
+            candidate = data.candidate,
+            sdpMid = data.sdpMid,
+            sdpMLineIndex = data.sdpMLineIndex
+        });
+        
+        pc.AddIceCandidate(candidate);
+        Debug.Log($"[VoiceChat] Added ICE candidate from: {peerId}");
+    }
+    
+    void SendSignalingMessage(string targetPeerId, string type, object data)
+    {
+        var wrapper = new SignalingWrapper
+        {
+            targetPeerId = targetPeerId,
+            payload = JsonUtility.ToJson(data)
+        };
+        
+        VRNetworkManager.Instance?.Send(type, wrapper);
+    }
+    
+    void SendIceCandidate(string targetPeerId, RTCIceCandidate candidate)
+    {
+        var data = new IceCandidateData
+        {
+            candidate = candidate.Candidate,
+            sdpMid = candidate.SdpMid,
+            sdpMLineIndex = candidate.SdpMLineIndex ?? 0
+        };
+        
+        SendSignalingMessage(targetPeerId, "webrtc-ice-candidate", data);
+    }
+    
+    #endregion
+    
+    #region Public API
+    
+    /// <summary>
+    /// Vérifie si le chat vocal est initialisé.
+    /// </summary>
+    public bool IsInitialized => _isInitialized;
+    
+    /// <summary>
+    /// Vérifie si le microphone est actif.
+    /// </summary>
+    public bool IsMicrophoneActive => _isMicrophoneActive;
+    
+    /// <summary>
+    /// Définit le volume du microphone.
+    /// </summary>
+    public void SetMicrophoneVolume(float volume)
+    {
+        microphoneVolume = Mathf.Clamp01(volume);
+    }
+    
+    /// <summary>
+    /// Définit le volume de lecture des autres joueurs.
+    /// </summary>
+    public void SetPlaybackVolume(float volume)
+    {
+        playbackVolume = Mathf.Clamp01(volume);
+        
+        foreach (var audioSource in _remoteAudioSources.Values)
+        {
+            audioSource.volume = playbackVolume;
+        }
+    }
+    
+    /// <summary>
+    /// Mute/Unmute un joueur spécifique.
+    /// </summary>
+    public void SetPlayerMuted(string playerId, bool muted)
+    {
+        if (_remoteAudioSources.TryGetValue(playerId, out var audioSource))
+        {
+            audioSource.mute = muted;
+        }
+    }
+    
+    /// <summary>
+    /// Vérifie si un joueur est connecté en vocal.
+    /// </summary>
+    public bool IsPlayerConnected(string playerId)
+    {
+        return _peerConnections.ContainsKey(playerId);
+    }
+    
+    /// <summary>
+    /// Retourne le nombre de connexions vocales actives.
+    /// </summary>
+    public int GetActiveConnectionCount()
+    {
+        return _peerConnections.Count;
+    }
+    
+    #endregion
+    
+    #region Debug GUI
+    
+    void OnGUI()
+    {
+        if (!showDebugInfo) return;
+        
+        GUILayout.BeginArea(new Rect(Screen.width - 310, 10, 300, 400));
+        GUILayout.BeginVertical("box");
+        
+        GUILayout.Label("=== Voice Chat Debug ===");
+        GUILayout.Label($"Initialized: {_isInitialized}");
+        GUILayout.Label($"Microphone Active: {_isMicrophoneActive}");
+        GUILayout.Label($"Selected Mic: {_selectedMicrophone}");
+        GUILayout.Label($"Peer Connections: {_peerConnections.Count}");
+        
+        GUILayout.Space(10);
+        
+        foreach (var kvp in _peerConnections)
+        {
+            var state = kvp.Value.IceConnectionState;
+            GUILayout.Label($"  {kvp.Key.Substring(0, 8)}: {state}");
+        }
+        
+        GUILayout.Space(10);
+        
+        if (GUILayout.Button(_isMicrophoneActive ? "Stop Mic" : "Start Mic"))
+        {
+            ToggleMicrophone();
+        }
+        
+        GUILayout.EndVertical();
+        GUILayout.EndArea();
+    }
+    
+    #endregion
+}
+
+#region Data Classes
+
+[Serializable]
+public class SignalingData
+{
+    public string sdp;
+    public string type;
+}
+
+[Serializable]
+public class IceCandidateData
+{
+    public string candidate;
+    public string sdpMid;
+    public int sdpMLineIndex;
+}
+
+[Serializable]
+public class SignalingWrapper
+{
+    public string targetPeerId;
+    public string payload;
+}
+
+#endregion
