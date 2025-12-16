@@ -147,7 +147,7 @@ MonoBehaviour:
   groundCheckDistance: 0.1
   groundLayers:
     serializedVersion: 2
-    m_Bits: 4294967295
+    m_Bits: 1
   syncWithHead: 1
   minHeight: 0.5
   maxHeight: 2.5
