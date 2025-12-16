@@ -13,9 +13,9 @@ public class VRMenuUI : MonoBehaviour
     public Button refreshButton;
     public TextMeshProUGUI titleText;
     
-    [Header("Main Panel - Join")]
+    [Header("Main Panel - Join by Code")]
     public TMP_InputField roomCodeInput;
-    public Button quickJoinButton;
+    public Button joinButton;  // Bouton pour rejoindre avec le code
     
     [Header("Main Panel - Room List")]
     public Transform roomListContainer;
@@ -55,8 +55,8 @@ public class VRMenuUI : MonoBehaviour
         // Boutons Main Panel
         if (refreshButton != null)
             refreshButton.onClick.AddListener(OnRefreshRooms);
-        if (quickJoinButton != null)
-            quickJoinButton.onClick.AddListener(OnQuickJoin);
+        if (joinButton != null)
+            joinButton.onClick.AddListener(OnJoinWithCode);
         if (newRoomButton != null)
             newRoomButton.onClick.AddListener(OnNewRoomClicked);
         
@@ -80,6 +80,10 @@ public class VRMenuUI : MonoBehaviour
         if (leaveRoomButton != null)
             leaveRoomButton.onClick.AddListener(OnLeaveRoom);
         
+        // Rejoindre avec la touche Entrée
+        if (roomCodeInput != null)
+            roomCodeInput.onSubmit.AddListener((_) => OnJoinWithCode());
+        
         // Events réseau
         VRNetworkManager.OnConnected += OnConnected;
         VRNetworkManager.OnDisconnected += OnDisconnected;
@@ -102,12 +106,13 @@ public class VRMenuUI : MonoBehaviour
     {
         // Nettoyer les listeners
         if (refreshButton != null) refreshButton.onClick.RemoveAllListeners();
-        if (quickJoinButton != null) quickJoinButton.onClick.RemoveAllListeners();
+        if (joinButton != null) joinButton.onClick.RemoveAllListeners();
         if (newRoomButton != null) newRoomButton.onClick.RemoveAllListeners();
         if (createButton != null) createButton.onClick.RemoveAllListeners();
         if (cancelButton != null) cancelButton.onClick.RemoveAllListeners();
         if (maxPlayersSlider != null) maxPlayersSlider.onValueChanged.RemoveAllListeners();
         if (leaveRoomButton != null) leaveRoomButton.onClick.RemoveAllListeners();
+        if (roomCodeInput != null) roomCodeInput.onSubmit.RemoveAllListeners();
         
         // Events
         VRNetworkManager.OnConnected -= OnConnected;
@@ -129,8 +134,14 @@ public class VRMenuUI : MonoBehaviour
         VRRoomManager.Instance?.RequestRoomList();
     }
     
-    void OnQuickJoin()
+    void OnJoinWithCode()
     {
+        if (roomCodeInput == null)
+        {
+            SetStatus("Erreur: champ code non configuré");
+            return;
+        }
+        
         string code = roomCodeInput.text.Trim().ToUpper();
         if (string.IsNullOrEmpty(code))
         {
@@ -138,7 +149,14 @@ public class VRMenuUI : MonoBehaviour
             return;
         }
         
-        SetStatus("Connexion...");
+        if (code.Length != 6)
+        {
+            SetStatus("Le code doit faire 6 caractères");
+            return;
+        }
+        
+        SetStatus($"Connexion à {code}...");
+        Debug.Log($"[VRMenuUI] Attempting to join room: {code}");
         VRRoomManager.Instance?.JoinRoom(code);
     }
     

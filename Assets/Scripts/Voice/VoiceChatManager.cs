@@ -465,12 +465,36 @@ public class VoiceChatManager : MonoBehaviour
     
     void HandleOffer(NetworkMessage msg)
     {
-        var data = JsonUtility.FromJson<SignalingData>(msg.data);
-        string peerId = msg.senderId;
-        
-        Debug.Log($"[VoiceChat] Received offer from: {peerId}");
-        
-        StartCoroutine(ProcessOffer(peerId, data));
+        try
+        {
+            // msg.data est le payload JSON (déjà extrait par le serveur)
+            // Mais il peut encore être stringifié, essayons de le parser
+            string jsonData = msg.data;
+            
+            // Si le data commence par un guillemet, c'est qu'il est encore encodé
+            if (jsonData.StartsWith("\""))
+            {
+                jsonData = JsonUtility.FromJson<string>(jsonData);
+            }
+            
+            var data = JsonUtility.FromJson<SignalingData>(jsonData);
+            string peerId = msg.senderId;
+            
+            if (string.IsNullOrEmpty(data.sdp))
+            {
+                Debug.LogError($"[VoiceChat] Received offer with empty SDP from: {peerId}");
+                Debug.LogError($"[VoiceChat] Raw data: {msg.data}");
+                return;
+            }
+            
+            Debug.Log($"[VoiceChat] Received offer from: {peerId}");
+            StartCoroutine(ProcessOffer(peerId, data));
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogError($"[VoiceChat] Error parsing offer: {e.Message}");
+            Debug.LogError($"[VoiceChat] Raw data: {msg.data}");
+        }
     }
     
     IEnumerator ProcessOffer(string peerId, SignalingData data)
@@ -530,12 +554,34 @@ public class VoiceChatManager : MonoBehaviour
     
     void HandleAnswer(NetworkMessage msg)
     {
-        var data = JsonUtility.FromJson<SignalingData>(msg.data);
-        string peerId = msg.senderId;
-        
-        Debug.Log($"[VoiceChat] Received answer from: {peerId}");
-        
-        StartCoroutine(ProcessAnswer(peerId, data));
+        try
+        {
+            string jsonData = msg.data;
+            
+            // Si le data commence par un guillemet, c'est qu'il est encore encodé
+            if (jsonData.StartsWith("\""))
+            {
+                jsonData = JsonUtility.FromJson<string>(jsonData);
+            }
+            
+            var data = JsonUtility.FromJson<SignalingData>(jsonData);
+            string peerId = msg.senderId;
+            
+            if (string.IsNullOrEmpty(data.sdp))
+            {
+                Debug.LogError($"[VoiceChat] Received answer with empty SDP from: {peerId}");
+                Debug.LogError($"[VoiceChat] Raw data: {msg.data}");
+                return;
+            }
+            
+            Debug.Log($"[VoiceChat] Received answer from: {peerId}");
+            StartCoroutine(ProcessAnswer(peerId, data));
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogError($"[VoiceChat] Error parsing answer: {e.Message}");
+            Debug.LogError($"[VoiceChat] Raw data: {msg.data}");
+        }
     }
     
     IEnumerator ProcessAnswer(string peerId, SignalingData data)
@@ -563,24 +609,46 @@ public class VoiceChatManager : MonoBehaviour
     
     void HandleIceCandidate(NetworkMessage msg)
     {
-        var data = JsonUtility.FromJson<IceCandidateData>(msg.data);
-        string peerId = msg.senderId;
-        
-        if (!_peerConnections.TryGetValue(peerId, out var pc))
+        try
         {
-            Debug.LogWarning($"[VoiceChat] No peer connection for ICE candidate: {peerId}");
-            return;
+            string jsonData = msg.data;
+            
+            // Si le data commence par un guillemet, c'est qu'il est encore encodé
+            if (jsonData.StartsWith("\""))
+            {
+                jsonData = JsonUtility.FromJson<string>(jsonData);
+            }
+            
+            var data = JsonUtility.FromJson<IceCandidateData>(jsonData);
+            string peerId = msg.senderId;
+            
+            if (string.IsNullOrEmpty(data.candidate))
+            {
+                Debug.LogWarning($"[VoiceChat] Received empty ICE candidate from: {peerId}");
+                return;
+            }
+            
+            if (!_peerConnections.TryGetValue(peerId, out var pc))
+            {
+                Debug.LogWarning($"[VoiceChat] No peer connection for ICE candidate: {peerId}");
+                return;
+            }
+            
+            var candidateInit = new RTCIceCandidateInit
+            {
+                candidate = data.candidate,
+                sdpMid = data.sdpMid,
+                sdpMLineIndex = data.sdpMLineIndex
+            };
+            
+            var candidate = new RTCIceCandidate(candidateInit);
+            pc.AddIceCandidate(candidate);
+            Debug.Log($"[VoiceChat] Added ICE candidate from: {peerId}");
         }
-        
-        var candidate = new RTCIceCandidate(new RTCIceCandidateInit
+        catch (System.Exception e)
         {
-            candidate = data.candidate,
-            sdpMid = data.sdpMid,
-            sdpMLineIndex = data.sdpMLineIndex
-        });
-        
-        pc.AddIceCandidate(candidate);
-        Debug.Log($"[VoiceChat] Added ICE candidate from: {peerId}");
+            Debug.LogError($"[VoiceChat] Error parsing ICE candidate: {e.Message}");
+        }
     }
     
     void SendSignalingMessage(string targetPeerId, string type, object data)
